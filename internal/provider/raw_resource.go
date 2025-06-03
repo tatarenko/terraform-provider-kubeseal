@@ -1,22 +1,16 @@
-// Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
-
 package provider
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"encoding/base64"
-	"errors"
-	"fmt"
-	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealed-secrets/v1alpha1"
-	"github.com/bitnami-labs/sealed-secrets/pkg/crypto"
+	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
+	"github.com/bitnami-labs/sealed-secrets/pkg/kubeseal"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int32validator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"io"
-	"k8s.io/client-go/util/cert"
 	"strings"
 	"time"
 )
@@ -55,62 +49,67 @@ func (r *rawResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 		Description: "Manages an order.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
-				Description: "Name of the Secret",
+				Description: "Name of the secret",
 				Required:    true,
 			},
 			"namespace": schema.StringAttribute{
-				Required: true,
+				Description: "Namespace of the secret",
+				Required:    true,
 			},
 			"secret": schema.StringAttribute{
-				Required:  true,
-				Sensitive: true,
+				Description: "Plain text secret to be encrypted",
+				Required:    true,
+				Sensitive:   true,
 			},
 			"scope": schema.Int32Attribute{
-				Required: true,
+				Description: "Sealed secret scope: 0 strict | 1 namespace-wide | 2 cluster-wide",
+				Required:    true,
+				Validators: []validator.Int32{
+					int32validator.Between(0, 2),
+				},
+				MarkdownDescription: `
+				0 strict: the secret must be sealed with exactly the same name and namespace.
+				1 namespace-wide: you can freely rename the sealed secret within a given namespace.
+				2 cluster-wide: the secret can be unsealed in any namespace and can be given any name.
+				[Official Docs](https://github.com/bitnami-labs/sealed-secrets/tree/main?tab=readme-ov-file#scopes)
+				`,
 			},
 			"pubkey": schema.StringAttribute{
-				Required: true,
+				Required:    true,
+				Description: "Public Key to encrypt secret with",
 			},
 			"sealed": schema.StringAttribute{
-				Computed: true,
+				Computed:    true,
+				Description: "Encrypted secret string",
 			},
 			"last_updated": schema.StringAttribute{
-				Computed: true,
+				Computed:    true,
+				Description: "Timestamp of last updated time",
 			},
 		},
 	}
 }
 
-// Configure adds the provider configured client to the resource.
-func (r *rawResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
-}
-
-func ParseKey(r io.Reader) (*rsa.PublicKey, error) {
-	data, err := io.ReadAll(r)
+func encryptWrapper(plan rawSealModel, diagnostics diag.Diagnostics) (rawSealModel, error) {
+	reader := strings.NewReader(plan.PubKey.ValueString())
+	pubKey, err := kubeseal.ParseKey(reader)
 	if err != nil {
-		return nil, err
+		diagnostics.AddError("Error parsing pubkey", "Unexpected error: "+err.Error())
+		return plan, err
 	}
 
-	certs, err := cert.ParseCertsPEM(data)
+	w := new(bytes.Buffer)
+	sealingScope := ssv1alpha1.SealingScope(plan.Scope.ValueInt32())
+
+	err = kubeseal.EncryptSecretItem(w, plan.Name.ValueString(), plan.Namespace.ValueString(), []byte(plan.Secret.ValueString()), sealingScope, pubKey)
 	if err != nil {
-		return nil, err
+		diagnostics.AddError("Error encrypting secret item", "Unexpected error: "+err.Error())
+		return plan, err
 	}
 
-	// ParseCertsPem returns error if len(certs) == 0, but best to be sure...
-	if len(certs) == 0 {
-		return nil, errors.New("failed to read any certificates")
-	}
-
-	cert, ok := certs[0].PublicKey.(*rsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("expected RSA public key but found %v", certs[0].PublicKey)
-	}
-
-	if time.Now().After(certs[0].NotAfter) {
-		return nil, fmt.Errorf("failed to encrypt using an expired certificate on %v", certs[0].NotAfter.Format("January 2, 2006"))
-	}
-
-	return cert, nil
+	plan.Sealed = types.StringValue(w.String())
+	plan.LastUpdated = types.StringValue(time.Now().Format(time.RFC850))
+	return plan, nil
 }
 
 // Create a new resource.
@@ -123,33 +122,11 @@ func (r *rawResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 
-	reader := strings.NewReader(plan.PubKey.ValueString())
-
-	spkiKey, err := ParseKey(reader)
+	var err error
+	plan, err = encryptWrapper(plan, resp.Diagnostics)
 	if err != nil {
-		resp.Diagnostics.AddError("Error parsing pubkey", "Unexpected error: "+err.Error())
 		return
 	}
-
-	label := ssv1alpha1.EncryptionLabel(plan.Namespace.ValueString(), plan.Name.ValueString(), ssv1alpha1.SealingScope(plan.Scope.ValueInt32()))
-	out, err := crypto.HybridEncrypt(rand.Reader, spkiKey, []byte(plan.Secret.ValueString()), label)
-	if err != nil {
-		resp.Diagnostics.AddError(
-			"Error encrypting value",
-			"Unexpected error: "+err.Error(),
-		)
-		return
-	}
-
-	sealed := base64.StdEncoding.EncodeToString(out)
-	if len(sealed) == 0 {
-		resp.Diagnostics.AddError(
-			"Error Sealing not successful", "")
-		return
-	}
-
-	plan.Sealed = types.StringValue(base64.StdEncoding.EncodeToString(out))
-	plan.LastUpdated = types.StringValue(time.Now().Format(time.RFC850))
 
 	// Set state to fully populated data
 	diags = resp.State.Set(ctx, plan)
@@ -157,9 +134,6 @@ func (r *rawResource) Create(ctx context.Context, req resource.CreateRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
-}
-
-func (r *rawResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 }
 
 func (r *rawResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -171,33 +145,11 @@ func (r *rawResource) Update(ctx context.Context, req resource.UpdateRequest, re
 		return
 	}
 
-	reader := strings.NewReader(plan.PubKey.ValueString())
-
-	spkiKey, err := ParseKey(reader)
+	var err error
+	plan, err = encryptWrapper(plan, resp.Diagnostics)
 	if err != nil {
-		resp.Diagnostics.AddError("Error parsing pubkey", "Unexpected error: "+err.Error())
 		return
 	}
-
-	label := ssv1alpha1.EncryptionLabel(plan.Namespace.ValueString(), plan.Name.ValueString(), ssv1alpha1.SealingScope(plan.Scope.ValueInt32()))
-	out, err := crypto.HybridEncrypt(rand.Reader, spkiKey, []byte(plan.Secret.ValueString()), label)
-	if err != nil {
-		resp.Diagnostics.AddError(
-			"Error encrypting value",
-			"Unexpected error: "+err.Error(),
-		)
-		return
-	}
-
-	sealed := base64.StdEncoding.EncodeToString(out)
-	if len(sealed) == 0 {
-		resp.Diagnostics.AddError(
-			"Error Sealing not successful", "")
-		return
-	}
-
-	plan.Sealed = types.StringValue(sealed)
-	plan.LastUpdated = types.StringValue(time.Now().Format(time.RFC850))
 
 	// Set state to fully populated data
 	diags = resp.State.Set(ctx, plan)
@@ -205,6 +157,9 @@ func (r *rawResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
+}
+
+func (r *rawResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 }
 
 func (r *rawResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
