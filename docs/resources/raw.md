@@ -13,11 +13,11 @@ Manages an order.
 ## Example Usage
 
 ```terraform
-resource "kubeseal_raw" "exanple" {
+resource "kubeseal_raw" "example" {
   name      = "example"
   namespace = "default"
   secret    = "very_secret_secret"
-  scope     = 1
+  scope     = 0
   pubkey    = <<-EOT
   XXXXXXXXXXXXXXXXXXXXXXXXXX
   XXXXXXXXXXXXXXXXXXXXXXXXXX
@@ -31,13 +31,16 @@ resource "kubeseal_raw" "exanple" {
 
 ### Required
 
-- `name` (String) Name of the Secret
-- `namespace` (String)
-- `pubkey` (String)
-- `scope` (Number)
-- `secret` (String, Sensitive)
+- `name` (String) Name of the secret
+- `namespace` (String) Namespace of the secret
+- `pubkey` (String) Public Key to encrypt secret with
+- `scope` (Number) 0 strict: the secret must be sealed with exactly the same name and namespace.
+				1 namespace-wide: you can freely rename the sealed secret within a given namespace.
+				2 cluster-wide: the secret can be unsealed in any namespace and can be given any name.
+				[Official Docs](https://github.com/bitnami-labs/sealed-secrets/tree/main?tab=readme-ov-file#scopes)
+- `secret` (String, Sensitive) Plain text secret to be encrypted
 
 ### Read-Only
 
-- `last_updated` (String)
-- `sealed` (String)
+- `last_updated` (String) Timestamp of last updated time
+- `sealed` (String) Encrypted secret string
