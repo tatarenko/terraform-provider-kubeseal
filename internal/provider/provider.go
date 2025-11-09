@@ -44,5 +44,6 @@ func (p *terraformKubeseal) DataSources(_ context.Context) []func() datasource.D
 func (p *terraformKubeseal) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewRawResource,
+		NewRawsResource,
 	}
 }
